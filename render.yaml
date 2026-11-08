@@ -1,0 +1,13 @@
+# Render Blueprint for the online backend only
+services:
+  - type: web
+    name: tictactoe-online
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python backend/server.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0

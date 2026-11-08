@@ -1,0 +1,8 @@
+.build/
+*.apk
+*.aab
+*.idsig
+*.avif
+*.mp4
+__pycache__/
+.venv/
