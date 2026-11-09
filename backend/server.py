@@ -40,6 +40,7 @@ def make_room(code, name, avatar):
         "winner": 0, "winLine": None,
         "cells": [0]*9,
         "scoreX": 0, "scoreO": 0,
+        "version": 1,
         "tokens": {"X": tok, "O": None},
         "players": {
             "X": {"name": name[:12].upper(), "avatar": int(avatar), "lastSeen": now()},
@@ -62,6 +63,7 @@ def state(room, my_role=None):
         "winner": room["winner"], "winLine": room["winLine"],
         "cells": list(room["cells"]),
         "scoreX": room["scoreX"], "scoreO": room["scoreO"],
+        "version": room["version"],
         "players": {"X": pub_player(room["players"]["X"]),
                     "O": pub_player(room["players"]["O"])},
         "rematch": dict(room["rematch"]),
@@ -77,6 +79,12 @@ def role_for(room, token):
 
 def touch(room, role):
     room["players"][role]["lastSeen"] = now()
+    room["updatedAt"] = now()
+
+def bump(room):
+    """Bump on real state changes only (join/move/rematch/leave/profile) —
+    long-poll watchers wake on this, never on presence touches."""
+    room["version"] += 1
     room["updatedAt"] = now()
 
 def finish(room, winner):
@@ -125,13 +133,22 @@ class H(BaseHTTPRequestHandler):
             code = parts[1].upper()
             q = parse_qs(u.query)
             token = (q.get("token") or [None])[0] or self.headers.get("X-Player-Token")
-            with LOCK:
-                room = ROOMS.get(code)
-                if not room: return self._json(404, {"error": "room not found"})
-                role = role_for(room, token)
-                if not role: return self._json(403, {"error": "bad token"})
-                touch(room, role)
-                return self._json(200, state(room, role))
+            wait = (q.get("wait") or ["0"])[0] in ("1", "true")
+            try: since = int((q.get("since") or ["0"])[0])
+            except ValueError: since = 0
+            # Long-poll: hold the request (max 20s) until the room version changes.
+            # Turns arrive on the device the instant the opponent moves.
+            deadline = now() + 20.0
+            while True:
+                with LOCK:
+                    room = ROOMS.get(code)
+                    if not room: return self._json(404, {"error": "room not found"})
+                    role = role_for(room, token)
+                    if not role: return self._json(403, {"error": "bad token"})
+                    touch(room, role)
+                    if not wait or room["version"] != since or now() >= deadline:
+                        return self._json(200, state(room, role))
+                time.sleep(0.25)
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -168,7 +185,7 @@ class H(BaseHTTPRequestHandler):
                     room["players"]["O"] = {"name": name, "avatar": avatar, "lastSeen": now()}
                     room["status"] = "playing"
                     room["turn"] = room["starter"]
-                    room["updatedAt"] = now()
+                    bump(room)
                     return self._json(200, {"token": tok, "role": "O", "state": state(room, "O")})
                 role = role_for(room, token)
                 if not role: return self._json(403, {"error": "bad token"})
@@ -179,6 +196,7 @@ class H(BaseHTTPRequestHandler):
                     except ValueError: avatar = room["players"][role]["avatar"]
                     room["players"][role]["name"] = name
                     room["players"][role]["avatar"] = max(0, min(5, avatar))
+                    bump(room)
                     return self._json(200, state(room, role))
                 if action == "move":
                     if room["status"] != "playing":
@@ -202,6 +220,7 @@ class H(BaseHTTPRequestHandler):
                         room["status"] = "finished"; room["rematch"] = {"X": False, "O": False}
                     else:
                         room["turn"] = 3 - want
+                    bump(room)
                     return self._json(200, state(room, role))
                 if action == "rematch":
                     if room["status"] != "finished":
@@ -214,6 +233,7 @@ class H(BaseHTTPRequestHandler):
                         room["winner"] = 0; room["winLine"] = None
                         room["status"] = "playing"
                         room["rematch"] = {"X": False, "O": False}
+                    bump(room)
                     return self._json(200, state(room, role))
                 if action == "leave":
                     me = 1 if role == "X" else 2
@@ -228,7 +248,7 @@ class H(BaseHTTPRequestHandler):
                         else: room["scoreO"] += 1
                         room["status"] = "finished"
                         room["rematch"] = {"X": False, "O": False}
-                        room["updatedAt"] = now()
+                        bump(room)
                         return self._json(200, {"ok": True, "state": state(room, None)})
                     if room["players"]["X"] is None and room["players"]["O"] is None:
                         del ROOMS[code]
@@ -238,6 +258,7 @@ class H(BaseHTTPRequestHandler):
                         room["round"] = 1; room["scoreX"] = 0; room["scoreO"] = 0
                         room["starter"] = 1; room["turn"] = 1
                         room["rematch"] = {"X": False, "O": False}
+                        bump(room)
                     return self._json(200, {"ok": True})
         return self._json(404, {"error": "not found"})
 
