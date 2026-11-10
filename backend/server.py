@@ -6,15 +6,29 @@ API:  POST /rooms, POST /rooms/{code}/join, POST /rooms/{code}/spectate,
       POST /rooms/{code}/rematch, POST /rooms/{code}/leave,
       POST /rooms/{code}/profile, GET /health
 """
-import json, os, secrets, time, threading
+import json, os, secrets, time, threading, tempfile, atexit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WIN_LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]]
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 PRESENCE_WINDOW = 30.0
 ROOM_TTL = 1800.0
+# Abandonment forfeit: a turn holder silent this long mid-round loses it, so
+# the active player isn't stuck on RECONNECTING until the TTL purge.
+FORFEIT_STALE = float(os.environ.get("FORFEIT_STALE", "90"))
+# Hardening: bound total memory and slow down token-allocation spam.
+MAX_ROOMS = int(os.environ.get("MAX_ROOMS", "300"))
+CREATE_COOLDOWN = float(os.environ.get("CREATE_COOLDOWN", "3"))
+SPECTATE_COOLDOWN = float(os.environ.get("SPECTATE_COOLDOWN", "2"))
+# Persistence: rooms survive a process restart (deploy) via a periodic dump.
+# The free-tier filesystem is ephemeral per instance — full spin-downs need an
+# external store; this covers the common "Render restarted for a deploy" case.
+SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), "ttt3d_rooms.json")
+SNAPSHOT_EVERY = float(os.environ.get("SNAPSHOT_EVERY", "20"))
 
 ROOMS = {}
+_last_create = {}    # ip -> ts  (per-IP throttles, pruned in cleanup)
+_last_spectate = {}  # ip -> ts
 LOCK = threading.Lock()
 
 def now(): return time.time()
@@ -69,6 +83,7 @@ def state(room, my_role=None):
         "players": {"X": pub_player(room["players"]["X"]),
                     "O": pub_player(room["players"]["O"])},
         "rematch": dict(room["rematch"]),
+        "spectators": len(room.get("spectators", {})),
         "myRole": my_role,
         "updatedAt": room["updatedAt"],
     }
@@ -98,6 +113,33 @@ def bump(room):
     long-poll watchers wake on this, never on presence touches."""
     room["version"] += 1
     room["updatedAt"] = now()
+
+def forfeit_stale(room):
+    """Award the round to the opponent when the turn holder goes silent
+    mid-round (app killed / network gone). Returns True if it fired.
+    Must be called with LOCK held. Finishing sets status=finished, so this
+    can't double-fire on the same round."""
+    if room["status"] != "playing":
+        return False
+    role = "X" if room["turn"] == 1 else "O"
+    p = room["players"][role]
+    if p is None or now() - p["lastSeen"] <= FORFEIT_STALE:
+        return False
+    winner = 2 if role == "X" else 1
+    room["winner"] = winner
+    room["winLine"] = None
+    room["status"] = "finished"
+    room["rematch"] = {"X": False, "O": False}
+    if winner == 1: room["scoreX"] += 1
+    else: room["scoreO"] += 1
+    bump(room)
+    return True
+
+def client_ip(headers, addr):
+    xf = headers.get("X-Forwarded-For")
+    if xf:
+        return xf.split(",")[0].strip()
+    return addr[0] if addr else "?"
 
 def finish(room, winner):
     room["winner"] = winner
@@ -158,6 +200,10 @@ class H(BaseHTTPRequestHandler):
                     role = role_for(room, token)
                     if not role: return self._json(403, {"error": "bad token"})
                     touch(room, role, token)
+                    # Abandonment forfeit fires inside a poll: the bump wakes
+                    # the opponent's long-poll instantly with the finished state.
+                    # Runs after touch — a returning turn holder is never forfeited.
+                    forfeit_stale(room)
                     if not wait or room["version"] != since or now() >= deadline:
                         st = state(room, role)
                         # woke=True: the room changed before the deadline. The
@@ -174,11 +220,18 @@ class H(BaseHTTPRequestHandler):
         parts = u.path.strip("/").split("/")
         data = self._body()
         if parts == ["rooms"]:
-            name = str(data.get("name") or "PLAYER")[:12].upper() or "PLAYER"
-            try: avatar = int(data.get("avatar") or 0)
-            except ValueError: avatar = 0
-            avatar = max(0, min(5, avatar))
             with LOCK:
+                if len(ROOMS) >= MAX_ROOMS:
+                    return self._json(429, {"error": "server full"})
+                ip = client_ip(self.headers, self.client_address)
+                t = now()
+                if t - _last_create.get(ip, 0) < CREATE_COOLDOWN:
+                    return self._json(429, {"error": "slow down"})
+                _last_create[ip] = t
+                name = str(data.get("name") or "PLAYER")[:12].upper() or "PLAYER"
+                try: avatar = int(data.get("avatar") or 0)
+                except ValueError: avatar = 0
+                avatar = max(0, min(5, avatar))
                 code = new_code()
                 room, tok = make_room(code, name, avatar)
                 ROOMS[code] = room
@@ -208,6 +261,12 @@ class H(BaseHTTPRequestHandler):
                     # Read-only watcher: separate token that can never take a
                     # seat, move, vote, or set a profile. No bump — watching
                     # isn't a state change, so long-polls don't wake for it.
+                    # Throttled: each call allocates a token in the room dict.
+                    ip = client_ip(self.headers, self.client_address)
+                    t = now()
+                    if t - _last_spectate.get(ip, 0) < SPECTATE_COOLDOWN:
+                        return self._json(429, {"error": "slow down"})
+                    _last_spectate[ip] = t
                     tok = secrets.token_hex(16)
                     room.setdefault("spectators", {})[tok] = now()
                     return self._json(200, {"token": tok, "role": "S", "state": state(room, "S")})
@@ -305,6 +364,9 @@ def cleanup():
                 spec = r.get("spectators", {})
                 for t in [t for t, seen in spec.items() if now() - seen > 120.0]:
                     spec.pop(t, None)
+                # Abandonment forfeit for rooms nobody is polling (the poll
+                # path covers live rooms; this covers dead-but-not-empty ones).
+                forfeit_stale(r)
                 # Empty husk (everyone left) or long-abandoned: drop it.
                 # Spectators alone can't keep a room alive past the TTL, but
                 # while they're actively polling the room stays watchable.
@@ -312,13 +374,60 @@ def cleanup():
                          and not spec)
                 if empty or now() - r["updatedAt"] > ROOM_TTL:
                     ROOMS.pop(c, None)
+            # Keep the throttle dicts bounded too.
+            cutoff = now() - 300.0
+            for d in (_last_create, _last_spectate):
+                for ip in [ip for ip, t in d.items() if t < cutoff]:
+                    d.pop(ip, None)
+
+def write_snapshot():
+    """Dump all rooms to disk atomically. Must be called with LOCK held."""
+    tmp = SNAPSHOT_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"rooms": ROOMS}, f)
+    os.replace(tmp, SNAPSHOT_PATH)
+
+def snapshotter():
+    while True:
+        time.sleep(SNAPSHOT_EVERY)
+        try:
+            with LOCK:
+                if ROOMS:
+                    write_snapshot()
+        except Exception as e:
+            print("snapshot failed:", e)
+
+def restore_snapshot():
+    try:
+        with open(SNAPSHOT_PATH) as f:
+            data = json.load(f)
+        rooms = data.get("rooms", {})
+        with LOCK:
+            ROOMS.update(rooms)
+        if rooms:
+            print(f"restored {len(rooms)} room(s) from snapshot")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("restore failed:", e)
 
 def main():
     port = int(os.environ.get("PORT", "8000"))
+    restore_snapshot()
+    atexit.register(lambda: _atexit_snapshot())
     threading.Thread(target=cleanup, daemon=True).start()
+    threading.Thread(target=snapshotter, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)
     print(f"online backend on 0.0.0.0:{port} — create: POST /rooms")
     srv.serve_forever()
+
+def _atexit_snapshot():
+    try:
+        with LOCK:
+            if ROOMS:
+                write_snapshot()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
