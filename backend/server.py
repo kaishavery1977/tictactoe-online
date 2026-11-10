@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Tic Tac Toe 3D — authoritative multiplayer backend (stdlib only).
 Run:  python backend/server.py [--port 8000]
-API:  POST /rooms, POST /rooms/{code}/join, GET /rooms/{code}?token=...,
-      POST /rooms/{code}/move, POST /rooms/{code}/rematch,
-      POST /rooms/{code}/leave, POST /rooms/{code}/profile, GET /health
+API:  POST /rooms, POST /rooms/{code}/join, POST /rooms/{code}/spectate,
+      GET /rooms/{code}?token=..., POST /rooms/{code}/move,
+      POST /rooms/{code}/rematch, POST /rooms/{code}/leave,
+      POST /rooms/{code}/profile, GET /health
 """
 import json, os, secrets, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +48,7 @@ def make_room(code, name, avatar):
             "O": None,
         },
         "rematch": {"X": False, "O": False},
+        "spectators": {},  # token -> lastSeen; read-only watchers, never seats
         "createdAt": now(), "updatedAt": now(),
     }, tok
 
@@ -75,11 +77,21 @@ def role_for(room, token):
     for r in ("X", "O"):
         if token and token == room["tokens"].get(r):
             return r
+    # Spectator tokens are not seats — they only grant read-only access.
+    if token and token in room.get("spectators", {}):
+        return "S"
     return None
 
-def touch(room, role):
-    room["players"][role]["lastSeen"] = now()
+def touch(room, role, token=None):
     room["updatedAt"] = now()
+    if role == "S":
+        # Spectator presence lives in its own dict, never in a seat.
+        if token and token in room.get("spectators", {}):
+            room["spectators"][token] = now()
+        return
+    p = room["players"].get(role)
+    if p is not None:
+        p["lastSeen"] = now()
 
 def bump(room):
     """Bump on real state changes only (join/move/rematch/leave/profile) —
@@ -145,9 +157,14 @@ class H(BaseHTTPRequestHandler):
                     if not room: return self._json(404, {"error": "room not found"})
                     role = role_for(room, token)
                     if not role: return self._json(403, {"error": "bad token"})
-                    touch(room, role)
+                    touch(room, role, token)
                     if not wait or room["version"] != since or now() >= deadline:
-                        return self._json(200, state(room, role))
+                        st = state(room, role)
+                        # woke=True: the room changed before the deadline. The
+                        # client only samples RTT from woken polls — riding out
+                        # the full hold is the long-poll working, not latency.
+                        st["woke"] = bool(wait and room["version"] != since)
+                        return self._json(200, st)
                 time.sleep(0.25)
         return self._json(404, {"error": "not found"})
 
@@ -187,9 +204,25 @@ class H(BaseHTTPRequestHandler):
                     room["turn"] = room["starter"]
                     bump(room)
                     return self._json(200, {"token": tok, "role": "O", "state": state(room, "O")})
+                if action == "spectate":
+                    # Read-only watcher: separate token that can never take a
+                    # seat, move, vote, or set a profile. No bump — watching
+                    # isn't a state change, so long-polls don't wake for it.
+                    tok = secrets.token_hex(16)
+                    room.setdefault("spectators", {})[tok] = now()
+                    return self._json(200, {"token": tok, "role": "S", "state": state(room, "S")})
                 role = role_for(room, token)
                 if not role: return self._json(403, {"error": "bad token"})
-                touch(room, role)
+                touch(room, role, token)
+                if action == "leave" and role == "S":
+                    # Spectators just drop their token — no seat to forfeit.
+                    room.get("spectators", {}).pop(token, None)
+                    if (room["players"]["X"] is None and room["players"]["O"] is None
+                            and not room.get("spectators")):
+                        del ROOMS[code]
+                    return self._json(200, {"ok": True})
+                if role == "S":
+                    return self._json(403, {"error": "spectators are read-only"})
                 if action == "profile":
                     name = str(data.get("name") or room["players"][role]["name"])[:12].upper() or room["players"][role]["name"]
                     try: avatar = int(data.get("avatar", room["players"][role]["avatar"]))
@@ -250,7 +283,8 @@ class H(BaseHTTPRequestHandler):
                         room["rematch"] = {"X": False, "O": False}
                         bump(room)
                         return self._json(200, {"ok": True, "state": state(room, None)})
-                    if room["players"]["X"] is None and room["players"]["O"] is None:
+                    if (room["players"]["X"] is None and room["players"]["O"] is None
+                            and not room.get("spectators")):
                         del ROOMS[code]
                     else:
                         room["status"] = "waiting"
@@ -266,8 +300,18 @@ def cleanup():
     while True:
         time.sleep(60)
         with LOCK:
-            dead = [c for c, r in ROOMS.items() if now() - r["updatedAt"] > ROOM_TTL]
-            for c in dead: ROOMS.pop(c, None)
+            for c, r in list(ROOMS.items()):
+                # Spectator tokens expire fast — they're free to re-acquire.
+                spec = r.get("spectators", {})
+                for t in [t for t, seen in spec.items() if now() - seen > 120.0]:
+                    spec.pop(t, None)
+                # Empty husk (everyone left) or long-abandoned: drop it.
+                # Spectators alone can't keep a room alive past the TTL, but
+                # while they're actively polling the room stays watchable.
+                empty = (r["players"]["X"] is None and r["players"]["O"] is None
+                         and not spec)
+                if empty or now() - r["updatedAt"] > ROOM_TTL:
+                    ROOMS.pop(c, None)
 
 def main():
     port = int(os.environ.get("PORT", "8000"))
